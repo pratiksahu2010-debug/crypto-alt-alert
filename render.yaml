@@ -1,0 +1,16 @@
+services:
+  - type: web
+    name: crypto-alt-alert-bot
+    env: python
+    plan: starter
+    buildCommand: "pip install -r requirements.txt"
+    startCommand: "gunicorn main:app --bind 0.0.0.0:$PORT --workers 1 --threads 4 --timeout 120"
+    envVars:
+      - key: PYTHON_VERSION
+        value: 3.12.7
+      - key: DRY_RUN
+        value: "false"
+      - key: TELEGRAM_TOKEN
+        sync: false
+      - key: TELEGRAM_CHAT_ID
+        sync: false
