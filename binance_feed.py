@@ -18,6 +18,7 @@ version - public market data on Binance requires none.
 """
 
 import json
+import hashlib
 import logging
 import threading
 import time
@@ -147,12 +148,24 @@ class BinanceFeed:
             log.error(f"[BINANCE] Exception fetching candles for {symbol} after retry: {e}")
             return pd.DataFrame()
 
+    @staticmethod
+    def _stable_seed(symbol: str) -> int:
+        """
+        Deterministic seed for mock data, stable across process restarts.
+        Python's built-in hash() is randomized per-process by default (a
+        security feature against hash-flooding) - using it here meant
+        DRY_RUN mock data for the same symbol was DIFFERENT every time the
+        app restarted, making test results impossible to reproduce or
+        debug reliably. hashlib gives the same number every time.
+        """
+        return int(hashlib.md5(symbol.encode()).hexdigest(), 16)
+
     def _mock_candles(self, symbol: str) -> pd.DataFrame:
         """Synthetic candle series for DRY_RUN testing - no network calls at all."""
         import numpy as np
         n = 80
-        base = 1 + (hash(symbol) % 50000) / 100.0
-        rng = np.random.default_rng(abs(hash(symbol)) % (2**32))
+        base = 1 + (self._stable_seed(symbol) % 50000) / 100.0
+        rng = np.random.default_rng(abs(self._stable_seed(symbol)) % (2**32))
         closes = base + np.cumsum(rng.normal(0, base * 0.002, n))
         highs = closes + rng.uniform(0, base * 0.002, n)
         lows = closes - rng.uniform(0, base * 0.002, n)
