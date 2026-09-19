@@ -30,6 +30,7 @@ CREATE TABLE IF NOT EXISTS settings (
     active INTEGER DEFAULT 1,
     last_alert TEXT DEFAULT '',
     last_early_alert TEXT DEFAULT '',
+    last_momentum_alert TEXT DEFAULT '',
     cooldown_hours REAL DEFAULT 2,
     alert_count INTEGER DEFAULT 0,
     fail_count INTEGER DEFAULT 0,
@@ -69,12 +70,25 @@ CREATE TABLE IF NOT EXISTS error_log (
 class BotStorage:
     """One instance per bot, backed by its own SQLite file."""
 
-    def __init__(self, db_path: str, symbols: list):
+    def __init__(self, db_path: str, symbols: list, tz=None):
+        """
+        tz: optional timezone object (e.g. ZoneInfo("Asia/Kolkata")) used
+        for all internal timestamps. Defaults to None (naive/server-local),
+        preserved for backward compatibility - but every bot's main.py now
+        passes its real market timezone explicitly, so cooldown timestamps
+        and "today" date bucketing stay consistent with the rest of the
+        app's now-correct timezone handling, rather than silently using
+        the server's own clock (UTC on Render).
+        """
         os.makedirs(os.path.dirname(db_path), exist_ok=True)
         self.db_path = db_path
+        self.tz = tz
         self._init_db()
         self._migrate()
         self._seed_symbols(symbols)
+
+    def _now(self):
+        return datetime.now(self.tz)
 
     @contextmanager
     def _conn(self):
@@ -88,6 +102,12 @@ class BotStorage:
 
     def _init_db(self):
         with self._conn() as conn:
+            # WAL mode: significantly reduces "database is locked" errors
+            # under the concurrent writes the ThreadPoolExecutor-based
+            # scanning now produces (5 symbols processed simultaneously,
+            # each writing alerts/errors independently). Safe, standard
+            # SQLite optimization for this exact access pattern.
+            conn.execute("PRAGMA journal_mode=WAL")
             conn.executescript(SCHEMA)
 
     def _migrate(self):
@@ -100,6 +120,7 @@ class BotStorage:
         with self._conn() as conn:
             for stmt in [
                 "ALTER TABLE settings ADD COLUMN last_early_alert TEXT DEFAULT ''",
+                "ALTER TABLE settings ADD COLUMN last_momentum_alert TEXT DEFAULT ''",
                 "ALTER TABLE alert_log ADD COLUMN signal_type TEXT DEFAULT 'CONFIRMED'",
             ]:
                 try:
@@ -139,7 +160,7 @@ class BotStorage:
             return False
         last_alert = datetime.fromisoformat(row["last_alert"])
         cooldown = timedelta(hours=row["cooldown_hours"] or 2)
-        return datetime.now() < last_alert + cooldown
+        return self._now() < last_alert + cooldown
 
     def record_alert_sent(self, symbol: str):
         with self._conn() as conn:
@@ -147,7 +168,7 @@ class BotStorage:
                 """UPDATE settings
                    SET last_alert=?, alert_count = alert_count + 1, fail_count = 0
                    WHERE symbol=?""",
-                (datetime.now().isoformat(), symbol),
+                (self._now().isoformat(), symbol),
             )
 
     def is_in_early_cooldown(self, symbol: str, early_cooldown_hours: float) -> bool:
@@ -166,13 +187,35 @@ class BotStorage:
         if row["manual_reset"]:
             return False
         last_early = datetime.fromisoformat(row["last_early_alert"])
-        return datetime.now() < last_early + timedelta(hours=early_cooldown_hours)
+        return self._now() < last_early + timedelta(hours=early_cooldown_hours)
 
     def record_early_alert_sent(self, symbol: str):
         with self._conn() as conn:
             conn.execute(
                 "UPDATE settings SET last_early_alert=? WHERE symbol=?",
-                (datetime.now().isoformat(), symbol),
+                (self._now().isoformat(), symbol),
+            )
+
+    def is_in_momentum_cooldown(self, symbol: str, momentum_cooldown_hours: float) -> bool:
+        """Own independent cooldown for big-momentum alerts - doesn't
+        compete with the confirmed/early cooldowns for the same symbol."""
+        with self._conn() as conn:
+            row = conn.execute(
+                "SELECT last_momentum_alert, manual_reset FROM settings WHERE symbol=?",
+                (symbol,),
+            ).fetchone()
+        if not row or not row["last_momentum_alert"]:
+            return False
+        if row["manual_reset"]:
+            return False
+        last_momentum = datetime.fromisoformat(row["last_momentum_alert"])
+        return self._now() < last_momentum + timedelta(hours=momentum_cooldown_hours)
+
+    def record_momentum_alert_sent(self, symbol: str):
+        with self._conn() as conn:
+            conn.execute(
+                "UPDATE settings SET last_momentum_alert=? WHERE symbol=?",
+                (self._now().isoformat(), symbol),
             )
 
     def record_failure(self, symbol: str, broken_at: int, disable_at: int):
@@ -196,10 +239,10 @@ class BotStorage:
                 )
 
     def reset_all_cooldowns(self):
-        """Called daily at market close / before open. Clears both the
-        confirmed-alert cooldown AND the early-signal cooldown."""
+        """Called daily at market close / before open. Clears the
+        confirmed, early-signal, AND momentum-alert cooldowns."""
         with self._conn() as conn:
-            conn.execute("UPDATE settings SET last_alert='', last_early_alert='', manual_reset=0")
+            conn.execute("UPDATE settings SET last_alert='', last_early_alert='', last_momentum_alert='', manual_reset=0")
 
     def reset_fail_counts_if_healthy(self, symbol: str):
         with self._conn() as conn:
@@ -219,12 +262,12 @@ class BotStorage:
                    (timestamp, symbol, signal, price, vwap, rsi, adx, ema9, ema21,
                     volume, confidence, score, message_id, signal_type)
                    VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
-                (datetime.now().isoformat(), symbol, signal, price, vwap, rsi,
+                (self._now().isoformat(), symbol, signal, price, vwap, rsi,
                  adx, ema9, ema21, volume, confidence, score, str(message_id), signal_type),
             )
 
     def count_alerts_today(self):
-        today = datetime.now().date().isoformat()
+        today = self._now().date().isoformat()
         with self._conn() as conn:
             row = conn.execute(
                 "SELECT COUNT(*) c FROM alert_log WHERE timestamp LIKE ? AND signal_type='CONFIRMED'",
@@ -233,7 +276,7 @@ class BotStorage:
             return row["c"]
 
     def count_early_signals_today(self):
-        today = datetime.now().date().isoformat()
+        today = self._now().date().isoformat()
         with self._conn() as conn:
             row = conn.execute(
                 "SELECT COUNT(*) c FROM alert_log WHERE timestamp LIKE ? AND signal_type='EARLY'",
@@ -241,8 +284,17 @@ class BotStorage:
             ).fetchone()
             return row["c"]
 
+    def count_momentum_alerts_today(self):
+        today = self._now().date().isoformat()
+        with self._conn() as conn:
+            row = conn.execute(
+                "SELECT COUNT(*) c FROM alert_log WHERE timestamp LIKE ? AND signal_type='MOMENTUM'",
+                (f"{today}%",),
+            ).fetchone()
+            return row["c"]
+
     def top_symbols_today(self, limit=5):
-        today = datetime.now().date().isoformat()
+        today = self._now().date().isoformat()
         with self._conn() as conn:
             rows = conn.execute(
                 """SELECT symbol, COUNT(*) c FROM alert_log
@@ -260,11 +312,11 @@ class BotStorage:
             conn.execute(
                 """INSERT INTO error_log (timestamp, symbol, error_type, error_message, retry_count)
                    VALUES (?,?,?,?,?)""",
-                (datetime.now().isoformat(), symbol, error_type, str(error_message)[:500], retry_count),
+                (self._now().isoformat(), symbol, error_type, str(error_message)[:500], retry_count),
             )
 
     def errors_today_summary(self):
-        today = datetime.now().date().isoformat()
+        today = self._now().date().isoformat()
         with self._conn() as conn:
             rows = conn.execute(
                 """SELECT error_type, COUNT(*) c FROM error_log
