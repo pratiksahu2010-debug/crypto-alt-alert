@@ -174,3 +174,90 @@ def is_early_signal(result: SignalResult) -> bool:
         and result.reject_reason is None
         and config.EARLY_SCORE_MIN <= result.score < config.SCORE_ALERT_THRESHOLD
     )
+
+
+@dataclass
+class MomentumResult:
+    """
+    Separate from SignalResult on purpose. A big momentum breakout is, by
+    definition, often a price that has ALREADY moved meaningfully away
+    from VWAP - the confirmed/early tiers above deliberately reject that
+    (VWAP_MAX_DISTANCE_PCT is a hard gate meant to catch fair-value setups,
+    not breakouts). Without a separate path, a genuinely big move gets
+    silently discarded by that same gate - the opposite of what you want.
+    This path only requires VWAP to exist at all (still mandatory), not
+    to be close to it.
+    """
+    direction: Optional[str] = None
+    price: float = 0.0
+    vwap: float = 0.0
+    pct_move: float = 0.0
+    adx: float = 0.0
+    volume: float = 0.0
+    vol_avg20: float = 0.0
+    volume_multiple: float = 0.0
+    lookback_candles: int = 0
+    reject_reason: Optional[str] = None
+
+
+def detect_big_momentum(df) -> MomentumResult:
+    """
+    Independent of evaluate()/should_alert()/is_early_signal() above -
+    reads the dataframe directly rather than reusing SignalResult, so it
+    is never subject to the VWAP-distance hard gate. VWAP presence is
+    still mandatory (the one rule that never bends); VWAP *closeness* is
+    not required here, since a real breakout has usually already moved
+    away from it.
+
+    Fires when ALL of:
+      - price moved >= MOMENTUM_MIN_PCT_MOVE over the last
+        MOMENTUM_LOOKBACK_CANDLES candles (a fast, large move - not
+        a slow drift)
+      - ADX >= MOMENTUM_MIN_ADX (a strong trend, not noise)
+      - volume >= MOMENTUM_MIN_VOLUME_MULT x its 20-period average
+        (the move is backed by real participation, not a thin print)
+    """
+    result = MomentumResult()
+    if df is None or len(df) < config.MOMENTUM_LOOKBACK_CANDLES + 1:
+        result.reject_reason = "INSUFFICIENT_DATA"
+        return result
+
+    last = df.iloc[-1]
+    vwap = last["vwap"] if last["vwap"] == last["vwap"] else None  # NaN check
+    if vwap is None or vwap <= 0:
+        result.reject_reason = "VWAP_UNAVAILABLE"  # mandatory rule still applies
+        return result
+
+    price = float(last["close"])
+    lookback_idx = -1 - config.MOMENTUM_LOOKBACK_CANDLES
+    price_then = float(df.iloc[lookback_idx]["close"])
+    if price_then <= 0:
+        result.reject_reason = "INVALID_PRICE_HISTORY"
+        return result
+
+    pct_move = (price - price_then) / price_then * 100
+    adx = float(last["adx14"])
+    volume = float(last["volume"])
+    vol_avg20 = float(last["vol_avg20"]) if last["vol_avg20"] == last["vol_avg20"] else 0.0
+    volume_multiple = (volume / vol_avg20) if vol_avg20 > 0 else 0.0
+
+    result.price, result.vwap = price, float(vwap)
+    result.pct_move, result.adx = pct_move, adx
+    result.volume, result.vol_avg20, result.volume_multiple = volume, vol_avg20, volume_multiple
+    result.lookback_candles = config.MOMENTUM_LOOKBACK_CANDLES
+
+    strong_trend = adx >= config.MOMENTUM_MIN_ADX
+    strong_volume = volume_multiple >= config.MOMENTUM_MIN_VOLUME_MULT
+
+    if pct_move >= config.MOMENTUM_MIN_PCT_MOVE and strong_trend and strong_volume:
+        result.direction = "LONG"
+    elif pct_move <= -config.MOMENTUM_MIN_PCT_MOVE and strong_trend and strong_volume:
+        result.direction = "SHORT"
+    else:
+        result.reject_reason = "THRESHOLD_NOT_MET"
+
+    return result
+
+
+def is_big_momentum(result: MomentumResult) -> bool:
+    return result.direction is not None and result.reject_reason is None
