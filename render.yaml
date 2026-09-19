@@ -4,7 +4,7 @@ services:
     env: python
     plan: starter
     buildCommand: "pip install -r requirements.txt"
-    startCommand: "gunicorn main:app --bind 0.0.0.0:$PORT --workers 1 --threads 4 --timeout 120"
+    startCommand: "gunicorn main:app --bind 0.0.0.0:$PORT --worker-class gthread --workers 1 --threads 4 --timeout 300"
     envVars:
       - key: PYTHON_VERSION
         value: 3.12.7
