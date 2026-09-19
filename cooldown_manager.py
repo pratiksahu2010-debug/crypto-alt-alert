@@ -41,7 +41,20 @@ class CooldownManager:
     def start_early_cooldown(self, symbol: str):
         self.storage.record_early_alert_sent(symbol)
 
+    def can_alert_momentum(self, symbol: str) -> bool:
+        """Own independent cooldown for big-momentum alerts, using
+        config.MOMENTUM_COOLDOWN_HOURS - separate from confirmed/early so
+        a genuinely big move can still get flagged even if the symbol is
+        mid-cooldown on the other tiers."""
+        in_cooldown = self.storage.is_in_momentum_cooldown(symbol, config.MOMENTUM_COOLDOWN_HOURS)
+        if in_cooldown:
+            log.info(f"[COOLDOWN] {symbol} is in MOMENTUM cooldown, skipping momentum alert")
+        return not in_cooldown
+
+    def start_momentum_cooldown(self, symbol: str):
+        self.storage.record_momentum_alert_sent(symbol)
+
     def reset_all(self):
-        """Called by the daily reset job. Resets BOTH confirmed and early cooldowns."""
+        """Called by the daily reset job. Resets confirmed, early, AND momentum cooldowns."""
         self.storage.reset_all_cooldowns()
-        log.info("[COOLDOWN] All cooldowns (confirmed + early) reset for new trading day")
+        log.info("[COOLDOWN] All cooldowns (confirmed + early + momentum) reset for new trading day")
