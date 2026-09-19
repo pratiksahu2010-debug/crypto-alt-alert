@@ -13,6 +13,8 @@ import logging
 import sys
 import time
 from datetime import datetime, timezone
+from zoneinfo import ZoneInfo
+from concurrent.futures import ThreadPoolExecutor
 
 from flask import Flask, jsonify, request
 from apscheduler.schedulers.background import BackgroundScheduler
@@ -25,7 +27,8 @@ from storage import BotStorage
 from cooldown_manager import CooldownManager
 from binance_feed import feed
 from indicators import enrich_dataframe
-from scoring import evaluate, should_alert, is_early_signal
+from scoring import evaluate, should_alert, is_early_signal, detect_big_momentum, is_big_momentum
+from options_feed import get_atm_option
 
 logging.basicConfig(
     level=logging.INFO,
@@ -36,7 +39,12 @@ log = logging.getLogger("main")
 
 app = Flask(__name__)
 
-storage = BotStorage(config.SQLITE_PATH, config.SYMBOLS)
+UTC_TZ = ZoneInfo(config.TIMEZONE)  # this bot's timezone IS UTC by design (24/7, no
+                                      # single "home" timezone) - defined at module
+                                      # level so storage.py's "today" bucketing and
+                                      # cooldown timestamps use it consistently too.
+
+storage = BotStorage(config.SQLITE_PATH, config.SYMBOLS, tz=UTC_TZ)
 cooldown = CooldownManager(storage)
 
 
@@ -67,26 +75,32 @@ def process_symbol(symbol: str):
             storage.log_error(symbol, "VWAP_MISSING", "VWAP is N/A - alert skipped (mandatory rule)")
             return
 
-        if should_alert(result):
-            if not cooldown.can_alert(symbol):
-                return
-            message_id = telegram_notify.send_trade_alert(
-                config.TELEGRAM_TOKEN, config.TELEGRAM_CHAT_ID, config.BOT_NAME, result, symbol
-            )
-            storage.log_alert(
-                symbol, result.direction, result.price, result.vwap, result.rsi,
-                result.adx, result.ema9, result.ema21, result.volume,
-                result.confidence, result.score, message_id, signal_type="CONFIRMED",
-            )
-            cooldown.start_cooldown(symbol)
-            storage.reset_fail_counts_if_healthy(symbol)
-            log.info(f"ALERT SENT: {symbol} {result.direction} score={result.score}/10")
-            return
+        any_alert_sent = False
 
-        if config.EARLY_SIGNAL_ENABLED and is_early_signal(result):
+        # --- Tier 1: Confirmed (score >= SCORE_ALERT_THRESHOLD) ---
+        if should_alert(result):
+            if cooldown.can_alert(symbol):
+                option_ctx = get_atm_option(symbol, result.direction) if config.OPTIONS_CONTEXT_ENABLED else None
+                message_id = telegram_notify.send_trade_alert(
+                    config.TELEGRAM_TOKEN, config.TELEGRAM_CHAT_ID, config.BOT_NAME, result, symbol,
+                    option_ctx=option_ctx,
+                )
+                storage.log_alert(
+                    symbol, result.direction, result.price, result.vwap, result.rsi,
+                    result.adx, result.ema9, result.ema21, result.volume,
+                    result.confidence, result.score, message_id, signal_type="CONFIRMED",
+                )
+                cooldown.start_cooldown(symbol)
+                log.info(f"ALERT SENT: {symbol} {result.direction} score={result.score}/10")
+                any_alert_sent = True
+
+        # --- Tier 2: Early/building (EARLY_SCORE_MIN <= score < SCORE_ALERT_THRESHOLD) ---
+        elif config.EARLY_SIGNAL_ENABLED and is_early_signal(result):
             if cooldown.can_alert_early(symbol):
+                option_ctx = get_atm_option(symbol, result.direction) if config.OPTIONS_CONTEXT_ENABLED else None
                 early_message_id = telegram_notify.send_early_signal(
-                    config.TELEGRAM_TOKEN, config.TELEGRAM_CHAT_ID, config.BOT_NAME, result, symbol
+                    config.TELEGRAM_TOKEN, config.TELEGRAM_CHAT_ID, config.BOT_NAME, result, symbol,
+                    option_ctx=option_ctx,
                 )
                 storage.log_alert(
                     symbol, result.direction, result.price, result.vwap, result.rsi,
@@ -95,10 +109,25 @@ def process_symbol(symbol: str):
                 )
                 cooldown.start_early_cooldown(symbol)
                 log.info(f"EARLY SIGNAL: {symbol} {result.direction} score={result.score}/10 (building)")
-            storage.reset_fail_counts_if_healthy(symbol)
-            return
+                any_alert_sent = True
 
-        # Below even the early threshold - healthy scan, nothing to report
+        # --- Tier 3: Big momentum - runs INDEPENDENTLY of tiers 1/2 above ---
+        if config.MOMENTUM_ENABLED:
+            momentum_result = detect_big_momentum(df)
+            if is_big_momentum(momentum_result) and cooldown.can_alert_momentum(symbol):
+                momentum_message_id = telegram_notify.send_momentum_alert(
+                    config.TELEGRAM_TOKEN, config.TELEGRAM_CHAT_ID, config.BOT_NAME, momentum_result, symbol
+                )
+                storage.log_alert(
+                    symbol, momentum_result.direction, momentum_result.price, momentum_result.vwap,
+                    0, momentum_result.adx, 0, 0, momentum_result.volume,
+                    "HIGH", 10, momentum_message_id, signal_type="MOMENTUM",
+                )
+                cooldown.start_momentum_cooldown(symbol)
+                log.info(f"BIG MOMENTUM: {symbol} {momentum_result.direction} "
+                         f"{momentum_result.pct_move:+.2f}% over {momentum_result.lookback_candles} candles")
+                any_alert_sent = True
+
         storage.reset_fail_counts_if_healthy(symbol)
 
     except Exception as e:
@@ -109,14 +138,25 @@ def process_symbol(symbol: str):
 
 
 def check_all_symbols():
-    """No market-hours gate - crypto trades 24/7/365."""
+    """No market-hours gate - crypto trades 24/7/365. Processes 5 symbols
+    concurrently per batch instead of sequentially - Binance's public rate
+    limits are generous enough that this is safe, and it substantially
+    reduces total scan time plus the risk of a long scan starving
+    gunicorn's worker heartbeat (see Procfile)."""
     active_rows = storage.get_active_symbols()
     symbols = [r["symbol"] for r in active_rows]
-    log.info(f"Scanning {len(symbols)} active symbols...")
-    for i in range(0, len(symbols), 5):
-        for sym in symbols[i:i + 5]:
-            process_symbol(sym)
-            time.sleep(0.5)  # Binance's public rate limits are generous - light throttle is enough
+    log.info(f"Scanning {len(symbols)} active symbols (5 concurrent per batch)...")
+    batch_size = 5
+    with ThreadPoolExecutor(max_workers=batch_size) as executor:
+        for i in range(0, len(symbols), batch_size):
+            batch = symbols[i:i + batch_size]
+            futures = [executor.submit(process_symbol, sym) for sym in batch]
+            for future in futures:
+                try:
+                    future.result()
+                except Exception:
+                    log.exception("Unhandled exception in concurrent batch processing")
+            time.sleep(0.5)  # brief pause BETWEEN batches, not between every symbol
 
 
 # ---------------------------------------------------------------------- #
@@ -138,9 +178,11 @@ def job_daily_reset():
 def job_daily_summary():
     total = storage.count_alerts_today()
     total_early = storage.count_early_signals_today()
+    total_momentum = storage.count_momentum_alerts_today()
     top = storage.top_symbols_today()
     telegram_notify.send_daily_summary(config.TELEGRAM_TOKEN, config.TELEGRAM_CHAT_ID,
-                                        config.BOT_NAME, total, top, total_early=total_early)
+                                        config.BOT_NAME, total, top,
+                                        total_early=total_early, total_momentum=total_momentum)
 
 
 def job_error_summary():
@@ -163,17 +205,25 @@ def bootstrap():
 
     scheduler = BackgroundScheduler(timezone=config.TIMEZONE)
 
-    # Every N minutes, 24/7 - no day-of-week or hour restriction at all
+    # Every N minutes, 24/7 - no day-of-week or hour restriction at all.
+    # IntervalTrigger fires every N minutes from start regardless of
+    # timezone, so it's unaffected by the CronTrigger timezone issue below.
     scheduler.add_job(job_scan, IntervalTrigger(minutes=config.SCAN_INTERVAL_MINUTES), id="scan")
 
+    # BUG FIX (defensive): CronTrigger does NOT inherit the scheduler's
+    # timezone automatically (confirmed empirically). This bot's intended
+    # timezone is UTC, which happens to coincidentally match Render's
+    # server clock - but explicit timezone= here means these jobs stay
+    # correct even if run somewhere with a different system timezone
+    # (e.g. local hosting, Termux).
     reset_h, reset_m = map(int, config.DAILY_RESET_TIME.split(":"))
-    scheduler.add_job(job_daily_reset, CronTrigger(hour=reset_h, minute=reset_m), id="daily_reset")
+    scheduler.add_job(job_daily_reset, CronTrigger(hour=reset_h, minute=reset_m, timezone=UTC_TZ), id="daily_reset")
 
     sum_h, sum_m = map(int, config.DAILY_SUMMARY_TIME.split(":"))
-    scheduler.add_job(job_daily_summary, CronTrigger(hour=sum_h, minute=sum_m), id="daily_summary")
+    scheduler.add_job(job_daily_summary, CronTrigger(hour=sum_h, minute=sum_m, timezone=UTC_TZ), id="daily_summary")
 
     err_h, err_m = map(int, config.ERROR_SUMMARY_TIME.split(":"))
-    scheduler.add_job(job_error_summary, CronTrigger(hour=err_h, minute=err_m), id="error_summary")
+    scheduler.add_job(job_error_summary, CronTrigger(hour=err_h, minute=err_m, timezone=UTC_TZ), id="error_summary")
 
     scheduler.start()
     log.info(f"Scheduler started - scanning every {config.SCAN_INTERVAL_MINUTES} min, 24/7")
@@ -222,6 +272,7 @@ def status():
         "broken_symbols": broken,
         "alerts_sent_today": storage.count_alerts_today(),
         "early_signals_sent_today": storage.count_early_signals_today(),
+        "momentum_alerts_sent_today": storage.count_momentum_alerts_today(),
         "errors_today_total": total_errors,
         "errors_today_by_type": error_breakdown,
         "most_recent_errors": recent_errors,
