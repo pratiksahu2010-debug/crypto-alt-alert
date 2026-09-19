@@ -38,6 +38,7 @@ _BASE_TICKERS = [
     "XEC", "GALA", "CELR", "RVN", "BDAG", "NEAR", "AAVE", "VNI", "DAI", "XMR",
     "MNT", "DOT", "LTC", "LEO", "BCH", "BTC", "ETH", "SOL", "XRP", "AVAX",
     "BNB", "LIT", "ENA", "ZEC", "AKE", "ESPORTS", "UNI", "LINK", "MATIC",
+    "XAUT",
 ]
 _BUILT_IN_SYMBOLS = [f"{t}USDT" for t in _BASE_TICKERS]
 
@@ -72,12 +73,26 @@ EMA_FAST, EMA_SLOW = 9, 21
 RSI_PERIOD = 14
 ADX_PERIOD = 14
 
-SCORE_ALERT_THRESHOLD = 8
+SCORE_ALERT_THRESHOLD = 9
 EARLY_SIGNAL_ENABLED = True
-EARLY_SCORE_MIN = 6            # score 6-7/10 = building momentum, not yet confirmed (8+)
+EARLY_SCORE_MIN = 8            # score 8/10 = building momentum, not yet confirmed (9+)
 EARLY_COOLDOWN_HOURS = 0.5      # shorter than confirmed 2h - crypto moves fast on a 5-min
                                  # timeframe, so a developing setup can re-notify sooner
 COOLDOWN_HOURS = 2
+
+# ---------------------------------------------------------------------------
+# Big Momentum tier - independent of the VWAP-mandatory confirmed/early
+# system above. A real breakout has usually already moved away from VWAP,
+# which the confirmed/early tiers deliberately reject - without this
+# separate path, a genuinely big move would be silently missed. VWAP must
+# still exist (mandatory rule never bends), it just doesn't need to be
+# CLOSE to price here.
+MOMENTUM_ENABLED = True
+MOMENTUM_LOOKBACK_CANDLES = 5
+MOMENTUM_MIN_PCT_MOVE = 3.0
+MOMENTUM_MIN_ADX = 35
+MOMENTUM_MIN_VOLUME_MULT = 2.0
+MOMENTUM_COOLDOWN_HOURS = 0.5
 CANDLE_INTERVAL = "5m"                # Binance interval string (5-min timeframe as requested)
 SCAN_INTERVAL_MINUTES = 5             # matches your trading timeframe
 
@@ -96,6 +111,17 @@ SQLITE_PATH = str(BASE_DIR / "data" / "alerts.db")
 # ---------------------------------------------------------------------------
 TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN", "").strip()
 TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "").strip()
+
+# ---------------------------------------------------------------------------
+# Options context - BTC/ETH via Deribit (deribit_options_feed.py), XAUT via
+# Bybit (bybit_options_feed.py - Deribit itself has no XAUT options market;
+# Bybit launched one in June 2026). Everything else in your coin list still
+# gets no options section, same reasoning as before: no real market to
+# report. Both are free public APIs, no key needed. See options_feed.py for
+# the routing logic. Set to False to disable options context entirely and
+# keep alerts spot-only, exactly as before.
+# ---------------------------------------------------------------------------
+OPTIONS_CONTEXT_ENABLED = True
 
 DRY_RUN = os.environ.get("DRY_RUN", "false").lower() == "true"
 PORT = int(os.environ.get("PORT", "10000"))
