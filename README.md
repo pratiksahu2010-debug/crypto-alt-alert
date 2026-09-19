@@ -52,8 +52,11 @@ scoring.py               # 10-point scoring - identical logic, wider VWAP bands
 storage.py                # SQLite Settings/AlertLog/ErrorLog - identical
 cooldown_manager.py        # 2h cooldown policy - identical
 telegram_notify.py          # Alert formatting - adapted for USD + dynamic decimals
-main.py                       # 24/7 Flask + scheduler (no market-hours gate)
-bots_config/symbols.json       # optional override for the symbol list
+options_feed.py               # Routes BTC/ETH -> Deribit, XAUT -> Bybit
+deribit_options_feed.py        # Real options context for BTC/ETH (Deribit)
+bybit_options_feed.py           # Real options context for XAUT (Bybit)
+main.py                          # 24/7 Flask + scheduler (no market-hours gate)
+bots_config/symbols.json          # optional override for the symbol list
 ```
 
 ## What's different from the NSE version
@@ -131,3 +134,39 @@ request volume further.
   historical crypto data before trusting it with real capital; crypto's
   volatility profile is different enough from equities that the same
   score threshold may not perform the same way.
+
+## Options context for BTC, ETH and XAUT
+
+When a BTC, ETH, or XAUT (Tether Gold) spot signal fires (confirmed or
+early), the alert now includes a real, live options context section -
+the nearest at-the-money call (for LONG) or put (for SHORT), its actual
+strike, expiry, live premium, and implied volatility. Routing is handled
+by `options_feed.py`:
+
+- **BTC, ETH** → **Deribit's** free public API (`deribit_options_feed.py`)
+- **XAUT** → **Bybit's** free public v5 API (`bybit_options_feed.py`) -
+  Deribit itself has no XAUT options market (it only lists options on
+  PAXG, a different gold token); Bybit launched a dedicated,
+  market-maker-backed XAUT options market in June 2026, settled in USDT.
+
+**This is deliberately NOT a second scoring system.** An option's price
+is driven by strike distance, time decay, and implied volatility - not
+simple price-trending the way VWAP/RSI/ADX measure a spot price. Rather
+than fabricate a technical score on the option premium (which would
+produce numbers that look like a signal without measuring what actually
+matters for options), this reports the real option's live data as
+context alongside your existing, legitimate spot-based signal. It's
+explicitly labeled "context only, not a signal" in every alert.
+
+**Scope: BTC, ETH, and XAUT only.** These are the only three coins in
+your list with a real, live options market anywhere (SOL is listed
+intermittently on Deribit and is treated as best-effort/optional inside
+`deribit_options_feed.py` if you want to add it). Everything else keeps
+alerting exactly as before, with no options section - not because the
+code is broken, but because there's nothing real to report for them.
+Note the XAUT premium is quoted directly in USD (Bybit's contracts are
+USDT-settled), unlike BTC/ETH where Deribit also shows the premium in
+units of the underlying coin.
+
+To disable this feature entirely and go back to spot-only alerts, set
+`OPTIONS_CONTEXT_ENABLED = False` in `config.py`.
